@@ -179,7 +179,7 @@ public class FDBReverseDirectoryCache {
     public CompletableFuture<Optional<String>> getInReverseDirectoryCacheSubspace(@Nullable FDBStoreTimer timer, @Nonnull ScopedValue<Long> scopedReverseDirectoryKey) {
         FDBRecordContext context = fdb.openContext();
         context.setTimer(timer);
-        return getReverseCacheSubspace(scopedReverseDirectoryKey.getScope())
+        return getReverseCacheSubspace(context, scopedReverseDirectoryKey.getScope())
                 .thenCompose(subspace -> getFromSubspace(context, subspace, scopedReverseDirectoryKey))
                 .whenComplete((result, exception) -> context.close());
     }
@@ -217,7 +217,7 @@ public class FDBReverseDirectoryCache {
     public CompletableFuture<Optional<String>> get(@Nullable FDBStoreTimer timer, @Nonnull final ScopedValue<Long> scopedReverseDirectoryKey) {
         FDBRecordContext context = fdb.openContext();
         context.setTimer(timer);
-        CompletableFuture<Subspace> reverseCacheSubspaceFuture = getReverseCacheSubspace(scopedReverseDirectoryKey.getScope());
+        CompletableFuture<Subspace> reverseCacheSubspaceFuture = getReverseCacheSubspace(context, scopedReverseDirectoryKey.getScope());
         return reverseCacheSubspaceFuture
                 .thenCompose(subspace -> getFromSubspace(context, subspace, scopedReverseDirectoryKey))
                 .thenCompose(maybeKey -> {
@@ -228,14 +228,16 @@ public class FDBReverseDirectoryCache {
                     LOGGER.warn(KeyValueLogMessage.of("Value not found in reverse directory cache, need to scan",
                             "provided_key", scopedReverseDirectoryKey,
                             "subspace", context.join(reverseCacheSubspaceFuture)));
-                    final Subspace subdirs = scopedReverseDirectoryKey.getScope().getMappingSubspace();
+                    final CompletableFuture<Subspace> subdirsFuture = scopedReverseDirectoryKey.getScope().getMappingSubspace(context);
 
-                    return context.instrument(FDBStoreTimer.DetailEvents.RD_CACHE_DIRECTORY_SCAN, findNameForKey(context, subdirs, null, scopedReverseDirectoryKey))
-                            .thenApply(maybeNameOrContinuation -> {
-                                // findNameForKey loops until the key is found or the search space is exhausted, so
-                                // if it is present, then we definitely found the key.
-                                return maybeNameOrContinuation.map(NameOrContinuation::getName);
-                            });
+                    return context.instrument(FDBStoreTimer.DetailEvents.RD_CACHE_DIRECTORY_SCAN,
+                            subdirsFuture.thenCompose(subdirs ->
+                                    findNameForKey(context, subdirs, null, scopedReverseDirectoryKey))
+                                        .thenApply(maybeNameOrContinuation -> {
+                                            // findNameForKey loops until the key is found or the search space is exhausted, so
+                                            // if it is present, then we definitely found the key.
+                                            return maybeNameOrContinuation.map(NameOrContinuation::getName);
+                                        }));
                 })
                 .whenComplete((result, exception) -> context.close());
     }
@@ -353,7 +355,7 @@ public class FDBReverseDirectoryCache {
                 // The current context of the iterator may be different than the original
                 // one that was created above, so be careful to use the current one for our work.
                 Transaction tr = context.ensureActive();
-                return getReverseCacheSubspace(scopedReverseDirectoryKey.getScope())
+                return getReverseCacheSubspace(context, scopedReverseDirectoryKey.getScope())
                         .thenAccept(subspace -> tr.set(subspace.pack(reverseDirectoryKeyData), Tuple.from(foundKey[0]).pack()))
                         .thenCompose(vignore ->
                                 tr.commit().thenApply(ignored2 -> Optional.of(NameOrContinuation.name(foundKey[0]))));
@@ -381,7 +383,7 @@ public class FDBReverseDirectoryCache {
         final LocatableResolver scope = pathKey.getScope();
         final String key = pathKey.getData();
 
-        return getReverseCacheSubspace(scope)
+        return getReverseCacheSubspace(context, scope)
                 .thenCompose(reverseCacheSubspace -> scope.mustResolve(context, key)
                         .thenApply(value -> {
                             if (LOGGER.isDebugEnabled()) {
@@ -427,7 +429,7 @@ public class FDBReverseDirectoryCache {
             return AsyncUtil.DONE;
         }
 
-        return getReverseCacheSubspace(scope)
+        return getReverseCacheSubspace(context, scope)
                 .thenCompose(subspace -> putToSubspace(context, subspace, scopedPathString, pathValue));
     }
 
@@ -472,7 +474,7 @@ public class FDBReverseDirectoryCache {
     @VisibleForTesting
     public void rebuild(LocatableResolver scope) {
         try (FDBRecordContext context = fdb.openContext()) {
-            Subspace reverseCacheSubspace = fdb.asyncToSync(null, null, getReverseCacheSubspace(scope));
+            Subspace reverseCacheSubspace = fdb.asyncToSync(null, null, getReverseCacheSubspace(context, scope));
             context.ensureActive().clear(reverseCacheSubspace.range());
             context.getDatabase().clearForwardDirectoryCache();
             persistentCacheMissCount.set(0L);
@@ -481,9 +483,9 @@ public class FDBReverseDirectoryCache {
         }
     }
 
-    private CompletableFuture<Subspace> getReverseCacheSubspace(LocatableResolver scope) {
-        return reverseDirectoryCacheEntry.thenApply(entry ->
-                scope.getBaseSubspace().subspace(Tuple.from(entry)));
+    private CompletableFuture<Subspace> getReverseCacheSubspace(FDBRecordContext context, LocatableResolver scope) {
+        return reverseDirectoryCacheEntry.thenCombine(scope.getBaseSubspace(context), (entry, subspace) ->
+                subspace.subspace(Tuple.from(entry)));
     }
 
     private void populate(final FDBRecordContext initialContext, Subspace directory) {
